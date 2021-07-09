@@ -1,0 +1,1177 @@
+---
+title: "sc_diff_exp"
+author: "Eloi Schmauch"
+date: "2/9/2021"
+output: html_document
+---
+
+
+```{r}
+#library(MAST) 
+#library(data.table)
+library(lme4)
+library(reticulate)
+library(ggplot2)
+library(nebula)
+library(rhdf5)
+library(parallel)
+library(Matrix)
+#options(mc.cores = detectCores() - 1) #if you have multiple cores to spin
+options(mc.cores = 12)
+#knitr::opts_chunk$set(message = FALSE,error = FALSE,warning = FALSE,cache = FALSE,fig.width=8,fig.height=6)
+
+```
+
+
+
+# load env
+
+```{bash}
+pip install scanpy
+```
+# othe 
+
+```{r}
+#install.packages("devtools")
+#devtools::install_git('https://gitlab.phe.gov.uk/phe/r/packages/phemisc ')
+#library(phemisc)
+```
+
+
+# Import the single cell data
+
+```{python}
+import scanpy as sc
+import pandas as pd
+adata = sc.read_h5ad("subadata_EC2.h5ad")
+print(set(adata.obs.tentative_subtypes))
+sc.pl.umap(adata, color = 'tentative_subtypes')
+adata = adata[adata.obs.tentative_subtypes == "Coronary artery"]
+adata = adata[adata.obs.phenotype.isin(["CAD", "Control"])]
+adata.obs["wellKey"] = adata.obs.index.to_list()
+adata.raw.var["primerid"] = adata.raw.var.index.to_list()
+adata.var["primerid"] = adata.var.index.to_list()
+sc.pl.umap(adata, color = 'phenotype')
+obs = adata.obs
+obs['cell'] = obs.index
+counts_df = pd.DataFrame(adata.raw.X.toarray(), index = adata.obs.index, columns = adata.raw.var.index)
+var_raw = adata.raw.var
+var = adata.var
+```
+
+
+
+## Transfer from python to R
+```{r}
+obs = py$obs
+expression = py$counts_df
+var_raw = py$var_raw
+var = py$var
+```
+
+
+##Nebula
+
+```{r}
+
+counts = h5read("counts.h5", "counts")
+
+cts_mtx = counts$block0_values
+cells_names = counts$axis0
+var_names = counts$axis1
+rm(counts)
+
+rownames(cts_mtx) = cells_names
+colnames(cts_mtx) = colnames(expression)
+
+sub_mtx = cts_mtx[rownames(expression),]
+
+phenotype = obs$phenotype
+phenotype<-factor(phenotype)
+phenotype<-relevel(phenotype,"Control")
+mito = scale(obs$percent_mito)
+n_counts = scale(obs$n_counts)
+pred = data.frame(mito, n_counts, phenotype)
+
+df = model.matrix(~mito+n_counts+phenotype, data=pred)
+
+re = nebula(t(sub_mtx),obs$sample_id,pred=df,method='HL')
+summ = re$summary[order(re$summary$p_phenotypeCAD, decreasing = FALSE),]
+
+summ
+```
+
+
+##Nebula function
+
+```{r}
+neb_analysis <- function(group_pheno, case, control, obs, sel = TRUE, group_sel, sel_id) {
+    if (sel) {
+        sub_obs = obs[obs[[group_sel]] == sel_id,]
+        print(sel_id)
+    } else {
+        sub_obs = obs
+    }
+    if (control == "ALL") {
+        sub_obs[[group_pheno]] = ifelse(sub_obs[[group_pheno]] == case, case, control)        
+    } else {
+        sub_obs = sub_obs[(sub_obs[[group_pheno]] == case) | (sub_obs[[group_pheno]] == control),]
+    }
+    sub_mtx = cts_mtx[rownames(sub_obs),]
+    phenotype = sub_obs[[group_pheno]]
+    phenotype<-factor(phenotype)
+    phenotype<-relevel(phenotype,control)
+    sample_id = sub_obs$sample_id
+    sample_id<-factor(sample_id)
+    mito = scale(sub_obs$percent_mito)
+    n_counts = scale(sub_obs$n_counts)
+    pred = data.frame(mito, n_counts, phenotype)
+    df = model.matrix(~mito+n_counts+phenotype, data=pred)
+    if(nrow(sub_obs) >= 1000){
+        method_sel = "LN"
+    } else {
+        method_sel = "HL" #HL or LN
+    }
+    re = nebula(t(sub_mtx),sample_id,pred=df,method=method_sel)
+    summ = na.omit(re$summary)
+    summ = summ[order(summ[[paste("p_phenotype", case, sep = "")]], decreasing = FALSE),]
+    return(summ)
+}
+```
+
+```{python}
+import scanpy as sc
+import pandas as pd
+adata = sc.read_h5ad("subadata_EC.h5ad")
+
+print(set(adata.obs.cell_types))
+#sc.pl.umap(adata, color = 'cell_types')
+sc.pl.umap(adata, color = 'tentative_subtypes')
+adata.obs["phenotype_HF"] = ["HF" if (x in ["HF_CAD", "HF_Congestive"]) else x for x in adata.obs.phenotype.to_list()]
+obs = adata.obs
+var_raw = adata.raw.var
+var = adata.var
+```
+
+## 
+```{r}
+obs = py$obs
+var_raw = py$var_raw
+var = py$var
+
+#test = neb_analysis(group_pheno = "tentative_subtypes", case = "Coronary artery", control = "ALL", obs = obs, sel = FALSE)
+
+counts = h5read("counts.h5", "counts")
+
+cts_mtx = counts$block0_values
+cells_names = counts$axis0
+var_names = counts$axis1
+rm(counts)
+
+rownames(cts_mtx) = cells_names
+colnames(cts_mtx) = rownames(var_raw)
+
+```
+
+
+
+
+
+```{r}
+subtypes = as.list(as.character(unique(obs$tentative_subtypes)))
+names(subtypes) = unique(obs$tentative_subtypes)
+lists_subtypes = mclapply(subtypes, function(subtype) {
+    return(neb_analysis(group_pheno = "tentative_subtypes", case = subtype, control = "ALL", obs = obs, sel = FALSE))
+}, mc.cores = 12)
+
+
+CA_CAD = neb_analysis(group_pheno = "phenotype", case = "CAD", control = "Control", obs = obs,sel = TRUE, group_sel = "tentative_subtypes", sel_id = "Coronary artery")
+CA_CAD = na.omit(CA_CAD)
+CA_CAD = CA_CAD[order(CA_CAD[["p_phenotypeCAD"]], decreasing = FALSE),]
+
+genes = CA_CAD[1:49, "gene"]
+flat_dat <- as(sca[genes,], 'data.table')
+ggbase <- ggplot(flat_dat, aes(x=phenotype, y=value,color=phenotype)) + geom_jitter()+facet_wrap(~primerid, scale='free_y')+ggtitle("DE Genes in CA (CAD)")
+ggbase+geom_violin() 
+
+
+
+
+lapply(names(lists_subtypes), function(subtype){
+    df = lists_subtypes[[subtype]][,c("gene", paste("logFC_phenotype", subtype, sep=""), paste("p_phenotype", subtype, sep=""))]
+    write.table(df, file = paste("results/markers_EC/markers", subtype, ".tsv", sep = ""), sep = '\t', row.names = FALSE)
+})
+
+
+lists_subtypes_CAD_2 = mclapply(subtypes_2, function(subtype) {
+    return(neb_analysis(group_pheno = "phenotype", case = "CAD", control = "Control", obs = obs, sel = TRUE, group_sel = "tentative_subtypes", sel_id = subtype))
+}, mc.cores = 12)
+
+subtypes_2 = subtypes[c(1,3,5,8,9,11)]
+
+lists_subtypes_CAD = lapply(subtypes, function(subtype) {
+    return(neb_analysis(group_pheno = "phenotype", case = "CAD", control = "Control", obs = obs, sel = TRUE, group_sel = "tentative_subtypes", sel_id = subtype))
+})
+
+lapply(names(lists_subtypes_CAD), function(subtype){
+    df = lists_subtypes_CAD[[subtype]][,c("gene", "logFC_phenotypeCAD", "p_phenotypeCAD")]
+    write.table(df, file = paste("results/DEG_EC_CADvCtrl/DEG_CADvCtrl_", subtype, ".tsv", sep = ""), sep = '\t', row.names = FALSE)
+})
+
+## HF_CAD
+
+lists_subtypes_HF_CAD = mclapply(subtypes, function(subtype) {
+    return(neb_analysis(group_pheno = "phenotype", case = "HF_CAD", control = "Control", obs = obs, sel = TRUE, group_sel = "tentative_subtypes", sel_id = subtype))
+}, mc.cores = 12)
+
+subtype = "PER"
+df = lists_subtypes_CAD[[subtype]][,c("gene", "logFC_phenotypeHF_CAD", "p_phenotypeHF_CAD")]
+
+lapply(names(lists_subtypes_HF_CAD), function(subtype){
+    df = lists_subtypes_HF_CAD[[subtype]][,c("gene", "logFC_phenotypeHF_CAD", "p_phenotypeHF_CAD")]
+    write.table(df, file = paste("results/DEG_EC_HF_CADvCtrl/DEG_HF_CADvCtrl_", subtype, ".tsv", sep = ""), sep = '\t', row.names = FALSE)
+})
+
+## HF Congestive
+
+lists_subtypes_HF_Congestive = lapply(subtypes, function(subtype) {
+    return(neb_analysis(group_pheno = "phenotype", case = "HF_Congestive", control = "Control", obs = obs, sel = TRUE, group_sel = "tentative_subtypes", sel_id = subtype))
+})
+
+lapply(names(lists_subtypes_HF_Congestive), function(subtype){
+    df = lists_subtypes_HF_Congestive[[subtype]][,c("gene", "logFC_phenotypeHF_Congestive", "p_phenotypeHF_Congestive")]
+    write.table(df, file = paste("results/DEG_EC_HF_CongestivevCtrl/DEG_HF_CongestivevCtrl_", subtype, ".tsv", sep = ""), sep = '\t', row.names = FALSE)
+})
+
+
+##HF only
+
+lists_subtypes_HF_Congestive = lapply(subtypes, function(subtype) {
+    return(neb_analysis(group_pheno = "phenotype_HF", case = "HF", control = "Control", obs = obs, sel = TRUE, group_sel = "tentative_subtypes", sel_id = subtype))
+})
+
+lapply(names(lists_subtypes_HF_Congestive), function(subtype){
+    df = lists_subtypes_HF_Congestive[[subtype]][,c("gene", "logFC_phenotypeHF", "p_phenotypeHF")]
+    write.table(df, file = paste("results/DEG_EC_allHFvsControl/DEG_HF_allvCtrl_", subtype, ".tsv", sep = ""), sep = '\t', row.names = FALSE)
+})
+
+```
+##Celltypes
+```{r}
+celltypes = as.list(as.character(unique(obs$cell_types)))
+names(celltypes) = unique(obs$cell_types)
+
+
+lists_celltypes_CAD = lapply(celltypes, function(subtype) {
+    return(neb_analysis(group_pheno = "phenotype", case = "CAD", control = "Control", obs = obs, sel = TRUE, group_sel = "cell_types", sel_id = subtype))
+})
+
+lapply(names(lists_celltypes_CAD), function(subtype){
+    df = lists_celltypes_CAD[[subtype]][,c("gene", "logFC_phenotypeCAD", "p_phenotypeCAD")]
+    write.table(df, file = paste("results/DEG_all_CADvsCtrl/DEG_CADvCtrl_", subtype, ".tsv", sep = ""), sep = '\t', row.names = FALSE)
+})
+
+##HF_CAD
+
+lists_celltypes_CAD = lapply(celltypes, function(subtype) {
+    return(neb_analysis(group_pheno = "phenotype", case = "HF_CAD", control = "Control", obs = obs, sel = TRUE, group_sel = "cell_types", sel_id = subtype))
+})
+
+lapply(names(lists_celltypes_CAD), function(subtype){
+    df = lists_celltypes_CAD[[subtype]][,c("gene", "logFC_phenotypeHF_CAD", "p_phenotypeHF_CAD")]
+    write.table(df, file = paste("results/DEG_EC_HF_CADvsCtrl/DEG_HF_CADvCtrl_", subtype, ".tsv", sep = ""), sep = '\t', row.names = FALSE)
+})
+
+##HF_Congestive
+
+lists_celltypes_CAD = lapply(celltypes, function(subtype) {
+    return(neb_analysis(group_pheno = "phenotype", case = "HF_Congestive", control = "Control", obs = obs, sel = TRUE, group_sel = "cell_types", sel_id = subtype))
+})
+
+lapply(names(lists_celltypes_CAD), function(subtype){
+    df = lists_celltypes_CAD[[subtype]][,c("gene", "logFC_phenotypeHF_Congestive", "p_phenotypeHF_Congestive")]
+    write.table(df, file = paste("results/DEG_all_HF_CongestivevsCtrl/DEG_HF_CongestivevCtrl_", subtype, ".tsv", sep = ""), sep = '\t', row.names = FALSE)
+})
+
+##HF_Only
+
+lists_celltypes_CAD = lapply(celltypes, function(subtype) {
+    return(neb_analysis(group_pheno = "phenotype_HF", case = "HF", control = "Control", obs = obs, sel = TRUE, group_sel = "cell_types", sel_id = subtype))
+})
+
+lapply(names(lists_celltypes_CAD), function(subtype){
+    df = lists_celltypes_CAD[[subtype]][,c("gene", "logFC_phenotypeHF", "p_phenotypeHF")]
+    write.table(df, file = paste("results/DEG_all_HF_allvControl/DEG_HF_allvCtrl_", subtype, ".tsv", sep = ""), sep = '\t', row.names = FALSE)
+})
+
+```
+## Other subtypes definition
+
+```{r}
+counts = h5read("counts.h5", "counts")
+
+cts_mtx = counts$block0_values
+cells_names = counts$axis0
+var_names = counts$axis1
+rm(counts)
+
+rownames(cts_mtx) = cells_names
+colnames(cts_mtx) = rownames(var_raw)
+
+cts_mtx <- as(cts_mtx, "sparseMatrix")
+
+```
+
+```{r}
+neb_analysis_v2 <- function(group_pheno, case, control, obs, sel = TRUE, group_sel, sel_id, sub_mtx) {
+    if (sel) {
+        sub_obs = obs[obs[[group_sel]] == sel_id,]
+        print(sel_id)
+    } else {
+        sub_obs = obs
+    }
+    if (control == "ALL") {
+        sub_obs[[group_pheno]] = ifelse(sub_obs[[group_pheno]] == case, case, control)        
+    } else {
+        sub_obs = sub_obs[(sub_obs[[group_pheno]] == case) | (sub_obs[[group_pheno]] == control),]
+    }
+    phenotype = sub_obs[[group_pheno]]
+    phenotype<-factor(phenotype)
+    phenotype<-relevel(phenotype,control)
+    sample_id = sub_obs$sample_id
+    sample_id<-factor(sample_id)
+    mito = scale(sub_obs$percent_mito)
+    n_counts = scale(sub_obs$n_counts)
+    pred = data.frame(mito, n_counts, phenotype)
+    df = model.matrix(~mito+n_counts+phenotype, data=pred)
+    if(nrow(sub_obs) >= 1000){
+        method_sel = "LN"
+    } else {
+        method_sel = "HL" #HL or LN
+    }
+    sub_mtx = sub_mtx[rownames(sub_obs),]
+    re = nebula(t(sub_mtx),sample_id,pred=df,method=method_sel)
+    summ = na.omit(re$summary)
+    summ = summ[order(summ[[paste("p_phenotype", case, sep = "")]], decreasing = FALSE),]
+    return(summ)
+}
+```
+
+
+
+```{python}
+import scanpy as sc
+import pandas as pd
+adata = sc.read_h5ad("subadata_CM.h5ad")
+
+print(set(adata.obs.cell_types))
+
+adata.obs['AF_status'] = adata.obs['sample_id'].astype(int).replace({1: 'Control',16: 'Postop', 22: 'Control', 174: "Postop", 281: "Preop",
+                                                                        35: 'Control', 66: 'Control', 202: 'Postop', 
+                                                                        201: 'Postop', 234: 'Preop', 170: 'Postop', 58: 'Preop', 91: "Control"})
+sc.pl.umap(adata, color = 'AF_status')
+adata.obs["phenotype_HF"] = ["HF" if (x in ["HF_CAD", "HF_Congestive"]) else x for x in adata.obs.phenotype.to_list()]
+adata.obs['subleiden'] = ["other" for x in adata.obs.index]
+adata.obs.loc[(adata.obs.leiden.isin(["0"])),'subleiden'] = "0"
+adata.obs.loc[(adata.obs.leiden.isin(["1", "3"])),'subleiden'] = "1+3"
+sc.pl.umap(adata, color = 'subleiden')
+adata.obs['IHD_enr'] = ["other" for x in adata.obs.index]
+adata.obs.loc[(adata.obs.leiden.isin(["0"]) & (adata.obs.phenotype == "CAD")),'IHD_enr'] = "CAD+"
+adata.obs.loc[(adata.obs.leiden.isin(["1", "3"]) & (adata.obs.phenotype == "Control")),'IHD_enr'] = "Control+"
+sc.pl.umap(adata, color = 'IHD_enr')
+
+
+obs_CM = adata.obs
+var_raw = adata.raw.var
+var = adata.var
+adata = sc.read_h5ad("differential_expression/h5ad/subadata_EEC.h5ad")
+adata.obs["phenotype_HF"] = ["HF" if (x in ["HF_CAD", "HF_Congestive"]) else x for x in adata.obs.phenotype.to_list()]
+obs_EEC = adata.obs
+adata = sc.read_h5ad("differential_expression/h5ad/subadata_FB.h5ad")
+adata.obs["phenotype_HF"] = ["HF" if (x in ["HF_CAD", "HF_Congestive"]) else x for x in adata.obs.phenotype.to_list()]
+obs_FB = adata.obs
+adata = sc.read_h5ad("differential_expression/h5ad/subadata_MESO.h5ad")
+adata.obs["phenotype_HF"] = ["HF" if (x in ["HF_CAD", "HF_Congestive"]) else x for x in adata.obs.phenotype.to_list()]
+obs_MESO = adata.obs
+
+adata = sc.read_h5ad("differentiel_expression/subadata_EC.h5ad")
+adata.obs["phenotype_HF"] = ["HF" if (x in ["HF_CAD", "HF_Congestive"]) else x for x in adata.obs.phenotype.to_list()]
+obs_vasc = adata.obs
+
+
+adata = sc.read_h5ad("celltypes_60_6000_500_0.1.h5ad")
+obs_all = adata.obs
+```
+
+```{r}
+obs_CM = py$obs_CM
+obs_EEC = py$obs_EEC
+obs_MESO = py$obs_MESO
+obs_FB = py$obs_FB
+obs_vasc = py$obs_vasc
+obs_all = py$obs_all
+var_raw = py$var_raw
+var = py$var
+
+```
+
+```{r}
+subtypes = as.list(as.character(unique(obs_CM$leiden)))
+names(subtypes) = unique(obs_CM$leiden)
+
+lists_subtypes = mclapply(subtypes, function(subtype) {
+    return(neb_analysis_v2(group_pheno = "leiden", case = subtype, control = "ALL", obs = obs_CM, sel = FALSE, sub_mtx = cts_mtx[rownames(obs_CM),] ))
+}, mc.cores = 12)
+names(lists_subtypes)
+
+lists_subtypes = lists_subtypes[c("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11")]
+df = lists_subtypes[[1]][,c("gene", paste("logFC_phenotype", names(lists_subtypes)[1], sep=""), paste("p_phenotype", names(lists_subtypes)[1], sep=""))]
+rows = row.names(df)
+for (i in 2:length(lists_subtypes)) {
+  df = cbind(df, lists_subtypes[[i]][rows ,c(paste("logFC_phenotype", names(lists_subtypes)[i], sep=""), paste("p_phenotype", names(lists_subtypes)[i], sep=""))])
+}
+write.table(df, file = paste("differential_expression/results/markers_subtypes/markers_CM_subtypes.tsv", sep = ""), sep = '\t', row.names = FALSE)
+
+
+## EEC
+subtypes = as.list(as.character(unique(obs_EEC$leiden)))
+names(subtypes) = unique(obs_EEC$leiden)
+
+lists_subtypes = mclapply(subtypes, function(subtype) {
+    return(neb_analysis_v2(group_pheno = "leiden", case = subtype, control = "ALL", obs = obs_EEC, sel = FALSE, sub_mtx = cts_mtx[rownames(obs_EEC),] ))
+}, mc.cores = 12)
+names(lists_subtypes)
+
+lists_subtypes = lists_subtypes[c("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12")]
+df = lists_subtypes[[1]][,c("gene", paste("logFC_phenotype", names(lists_subtypes)[1], sep=""), paste("p_phenotype", names(lists_subtypes)[1], sep=""))]
+rows = row.names(df)
+for (i in 2:length(lists_subtypes)) {
+  df = cbind(df, lists_subtypes[[i]][rows ,c(paste("logFC_phenotype", names(lists_subtypes)[i], sep=""), paste("p_phenotype", names(lists_subtypes)[i], sep=""))])
+}
+write.table(df, file = paste("differential_expression/results/markers_subtypes/markers_EEC_subtypes.tsv", sep = ""), sep = '\t', row.names = FALSE)
+
+
+##FB
+subtypes = as.list(as.character(unique(obs_FB$leiden)))
+names(subtypes) = unique(obs_FB$leiden)
+
+lists_subtypes = mclapply(subtypes, function(subtype) {
+    return(neb_analysis_v2(group_pheno = "leiden", case = subtype, control = "ALL", obs = obs_FB, sel = FALSE, sub_mtx = cts_mtx[rownames(obs_FB),] ))
+}, mc.cores = 12)
+names(lists_subtypes)
+
+lists_subtypes = lists_subtypes[c("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10")]
+df = lists_subtypes[[1]][,c("gene", paste("logFC_phenotype", names(lists_subtypes)[1], sep=""), paste("p_phenotype", names(lists_subtypes)[1], sep=""))]
+rows = row.names(df)
+for (i in 2:length(lists_subtypes)) {
+  df = cbind(df, lists_subtypes[[i]][rows ,c(paste("logFC_phenotype", names(lists_subtypes)[i], sep=""), paste("p_phenotype", names(lists_subtypes)[i], sep=""))])
+}
+write.table(df, file = paste("differential_expression/results/markers_subtypes/markers_FB_subtypes.tsv", sep = ""), sep = '\t', row.names = FALSE)
+
+
+##MESO
+subtypes = as.list(as.character(unique(obs_MESO$leiden)))
+names(subtypes) = unique(obs_MESO$leiden)
+
+lists_subtypes = mclapply(subtypes, function(subtype) {
+    return(neb_analysis_v2(group_pheno = "leiden", case = subtype, control = "ALL", obs = obs_MESO, sel = FALSE, sub_mtx = cts_mtx[rownames(obs_MESO),] ))
+}, mc.cores = 12)
+names(lists_subtypes)
+
+lists_subtypes = lists_subtypes[c("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12")]
+df = lists_subtypes[[1]][,c("gene", paste("logFC_phenotype", names(lists_subtypes)[1], sep=""), paste("p_phenotype", names(lists_subtypes)[1], sep=""))]
+rows = row.names(df)
+for (i in 2:length(lists_subtypes)) {
+  df = cbind(df, lists_subtypes[[i]][rows ,c(paste("logFC_phenotype", names(lists_subtypes)[i], sep=""), paste("p_phenotype", names(lists_subtypes)[i], sep=""))])
+}
+write.table(df, file = paste("differential_expression/results/markers_subtypes/markers_MESO_subtypes.tsv", sep = ""), sep = '\t', row.names = FALSE)
+
+##VASC
+subtypes = as.list(as.character(unique(obs_vasc$tentative_subtypes)))
+names(subtypes) = unique(obs_vasc$tentative_subtypes)
+
+lists_subtypes = mclapply(subtypes, function(subtype) {
+    return(neb_analysis_v2(group_pheno = "tentative_subtypes", case = subtype, control = "ALL", obs = obs_vasc, sel = FALSE, sub_mtx = cts_mtx[rownames(obs_vasc),] ))
+}, mc.cores = 12)
+names(lists_subtypes)
+
+lapply(names(lists_subtypes), function(subtype){
+    df = lists_subtypes[[subtype]][,c("gene", paste("logFC_phenotype", subtype, sep=""), paste("p_phenotype", subtype, sep=""))]
+    df = na.omit(df)
+    df = df[df[[paste("logFC_phenotype", subtype, sep="")]] > 0,]
+    df = df[order(df[[paste("p_phenotype", subtype, sep="")]]),]
+    df = df[df[[paste("p_phenotype", subtype, sep="")]] < 0.05,]
+    write.table(df, file = paste("differential_expression/results/markers_subtypes/For_guillermo/markers", subtype, ".tsv", sep = ""), sep = '\t', row.names = FALSE)
+})
+
+#All
+
+subtypes = as.list(as.character(unique(obs_all$cell_types)))
+names(subtypes) = unique(obs_all$cell_types)
+
+lists_subtypes = mclapply(subtypes, function(subtype) {
+    return(neb_analysis_v2(group_pheno = "cell_types", case = subtype, control = "ALL", obs = obs_all, sel = FALSE, sub_mtx = cts_mtx[rownames(obs_all),] ))
+}, mc.cores = 12)
+
+lapply(names(lists_subtypes), function(subtype){
+    df = lists_subtypes[[subtype]][,c("gene", paste("logFC_phenotype", subtype, sep=""), paste("p_phenotype", subtype, sep=""), "logFC_mito", "p_mito")]
+    df = na.omit(df)
+    df[,3] = p.adjust(df[,3], method = 'BH', n = length(df[,3]))
+    df[,5] = p.adjust(df[,3], method = 'BH', n = length(df[,5]))
+    df = df[df[[paste("logFC_phenotype", subtype, sep="")]] > 1,]
+    df = df[order(df[[paste("logFC_phenotype", subtype, sep="")]], decreasing = TRUE),]
+    df = df[df[[paste("p_phenotype", subtype, sep="")]] < 0.005,]
+    df = df[(df$p_mito > 0.05 | df$logFC_mito < 0),]
+    write.table(df, file = paste("differential_expression/results/markers_all/markers", subtype, ".tsv", sep = ""), sep = '\t', row.names = FALSE)
+})
+
+
+
+```
+
+
+## Differential exp analysis
+
+```{r}
+
+##CM
+subtypes = as.list(names(table(obs_CM$leiden) > 50))
+names(subtypes) = names(table(obs_CM$leiden) > 50)
+
+lists_subtypes = mclapply(subtypes, function(subtype) {
+    return(neb_analysis_v2(group_pheno = "phenotype", case = "CAD", control = "Control", obs = obs_CM, sel = TRUE, group_sel = "leiden", sel_id = subtype, sub_mtx = cts_mtx[rownames(obs_CM[obs_CM[["leiden"]] == subtype,]),]))
+}, mc.cores = 12)
+names(lists_subtypes)
+rows = c()
+for (subtype_res in lists_subtypes) {
+  rows = c(rows, row.names(subtype_res))
+}
+rows = unique(rows)
+df = lists_subtypes[[1]][rows,c("gene", "logFC_phenotypeCAD", "p_phenotypeCAD")]
+for (i in 2:length(lists_subtypes)) {
+  df = cbind(df, lists_subtypes[[i]][rows ,c("logFC_phenotypeCAD", "p_phenotypeCAD")])
+}
+write.table(df, file = paste("differential_expression/results/subtypes_DEG/CM_CAD_vCTRL.tsv", sep = ""), sep = '\t', row.names = FALSE)
+
+lists_subtypes = mclapply(subtypes, function(subtype) {
+    return(neb_analysis_v2(group_pheno = "phenotype", case = "HF_CAD", control = "Control", obs = obs_CM, sel = TRUE, group_sel = "leiden", sel_id = subtype, sub_mtx = cts_mtx[rownames(obs_CM[obs_CM[["leiden"]] == subtype,]),]))
+}, mc.cores = 12)
+names(lists_subtypes)
+rows = c() 
+for (subtype_res in lists_subtypes) {   rows = c(rows, row.names(subtype_res)) } 
+rows = unique(rows)
+df = lists_subtypes[[1]][rows, c("gene", "logFC_phenotypeHF_CAD", "p_phenotypeHF_CAD")]
+for (i in 2:length(lists_subtypes)) {
+  df = cbind(df, lists_subtypes[[i]][rows ,c("logFC_phenotypeHF_CAD", "p_phenotypeHF_CAD")])
+}
+write.table(df, file = paste("differential_expression/results/subtypes_DEG/CM_HF_CAD_vCTRL.tsv", sep = ""), sep = '\t', row.names = FALSE)
+
+lists_subtypes = mclapply(subtypes, function(subtype) {
+    return(neb_analysis_v2(group_pheno = "phenotype", case = "HF_Congestive", control = "Control", obs = obs_CM, sel = TRUE, group_sel = "leiden", sel_id = subtype, sub_mtx = cts_mtx[rownames(obs_CM[obs_CM[["leiden"]] == subtype,]),]))
+}, mc.cores = 12)
+names(lists_subtypes)
+rows = c() 
+for (subtype_res in lists_subtypes) {   rows = c(rows, row.names(subtype_res)) } 
+rows = unique(rows)
+df = lists_subtypes[[1]][rows,c("gene", "logFC_phenotypeHF_Congestive", "p_phenotypeHF_Congestive")]
+for (i in 2:length(lists_subtypes)) {
+  df = cbind(df, lists_subtypes[[i]][rows ,c("logFC_phenotypeHF_Congestive", "p_phenotypeHF_Congestive")])
+}
+write.table(df, file = paste("differential_expression/results/subtypes_DEG/CM_HF_Congestive_vCTRL.tsv", sep = ""), sep = '\t', row.names = FALSE)
+
+lists_subtypes = mclapply(subtypes, function(subtype) {
+    return(neb_analysis_v2(group_pheno = "phenotype_HF", case = "HF", control = "Control", obs = obs_CM, sel = TRUE, group_sel = "leiden", sel_id = subtype, sub_mtx = cts_mtx[rownames(obs_CM[obs_CM[["leiden"]] == subtype,]),]))
+}, mc.cores = 12)
+names(lists_subtypes)
+rows = c() 
+for (subtype_res in lists_subtypes) {   rows = c(rows, row.names(subtype_res)) } 
+rows = unique(rows)
+df = lists_subtypes[[1]][rows,c("gene", "logFC_phenotypeHF", "p_phenotypeHF")]
+for (i in 2:length(lists_subtypes)) {
+  df = cbind(df, lists_subtypes[[i]][rows ,c("logFC_phenotypeHF", "p_phenotypeHF")])
+}
+write.table(df, file = paste("differential_expression/results/subtypes_DEG/CM_HF_vCTRL.tsv", sep = ""), sep = '\t', row.names = FALSE)
+
+
+##EEC
+subtypes = as.list(names(table(obs_EEC$leiden))[table(obs_EEC$leiden) > 50])
+names(subtypes) = names(table(obs_EEC$leiden))[table(obs_EEC$leiden) > 50]
+
+lists_subtypes = mclapply(subtypes, function(subtype) {
+    return(neb_analysis_v2(group_pheno = "phenotype", case = "CAD", control = "Control", obs = obs_EEC, sel = TRUE, group_sel = "leiden", sel_id = subtype, sub_mtx = cts_mtx[rownames(obs_EEC[obs_EEC[["leiden"]] == subtype,]),]))
+}, mc.cores = 12)
+names(lists_subtypes)
+rows = c() 
+for (subtype_res in lists_subtypes) {   rows = c(rows, row.names(subtype_res)) } 
+rows = unique(rows)
+df = lists_subtypes[[1]][rows,c("gene", "logFC_phenotypeCAD", "p_phenotypeCAD")]
+for (i in 2:length(lists_subtypes)) {
+  df = cbind(df, lists_subtypes[[i]][rows ,c("logFC_phenotypeCAD", "p_phenotypeCAD")])
+}
+write.table(df, file = paste("differential_expression/results/subtypes_DEG/EEC_CAD_vCTRL.tsv", sep = ""), sep = '\t', row.names = FALSE)
+
+lists_subtypes = mclapply(subtypes, function(subtype) {
+    return(neb_analysis_v2(group_pheno = "phenotype", case = "HF_CAD", control = "Control", obs = obs_EEC, sel = TRUE, group_sel = "leiden", sel_id = subtype, sub_mtx = cts_mtx[rownames(obs_EEC[obs_EEC[["leiden"]] == subtype,]),]))
+}, mc.cores = 12)
+names(lists_subtypes)
+rows = c() 
+for (subtype_res in lists_subtypes) {   rows = c(rows, row.names(subtype_res)) } 
+rows = unique(rows)
+df = lists_subtypes[[1]][rows,c("gene", "logFC_phenotypeHF_CAD", "p_phenotypeHF_CAD")]
+for (i in 2:length(lists_subtypes)) {
+  df = cbind(df, lists_subtypes[[i]][rows ,c("logFC_phenotypeHF_CAD", "p_phenotypeHF_CAD")])
+}
+write.table(df, file = paste("differential_expression/results/subtypes_DEG/EEC_HF_CAD_vCTRL.tsv", sep = ""), sep = '\t', row.names = FALSE)
+
+lists_subtypes = mclapply(subtypes, function(subtype) {
+    return(neb_analysis_v2(group_pheno = "phenotype", case = "HF_Congestive", control = "Control", obs = obs_EEC, sel = TRUE, group_sel = "leiden", sel_id = subtype, sub_mtx = cts_mtx[rownames(obs_EEC[obs_EEC[["leiden"]] == subtype,]),]))
+}, mc.cores = 12)
+names(lists_subtypes)
+rows = c() 
+for (subtype_res in lists_subtypes) {   rows = c(rows, row.names(subtype_res)) } 
+rows = unique(rows)
+df = lists_subtypes[[1]][rows, c("gene", "logFC_phenotypeHF_Congestive", "p_phenotypeHF_Congestive")]
+for (i in 2:length(lists_subtypes)) {
+  df = cbind(df, lists_subtypes[[i]][rows ,c("logFC_phenotypeHF_Congestive", "p_phenotypeHF_Congestive")])
+}
+write.table(df, file = paste("differential_expression/results/subtypes_DEG/EEC_HF_Congestive_vCTRL.tsv", sep = ""), sep = '\t', row.names = FALSE)
+
+lists_subtypes = mclapply(subtypes, function(subtype) {
+    return(neb_analysis_v2(group_pheno = "phenotype_HF", case = "HF", control = "Control", obs = obs_EEC, sel = TRUE, group_sel = "leiden", sel_id = subtype, sub_mtx = cts_mtx[rownames(obs_EEC[obs_EEC[["leiden"]] == subtype,]),]))
+}, mc.cores = 12)
+names(lists_subtypes)
+rows = c() 
+for (subtype_res in lists_subtypes) {   rows = c(rows, row.names(subtype_res)) } 
+rows = unique(rows)
+df = lists_subtypes[[1]][rows,c("gene", "logFC_phenotypeHF", "p_phenotypeHF")]
+for (i in 2:length(lists_subtypes)) {
+  df = cbind(df, lists_subtypes[[i]][rows ,c("logFC_phenotypeHF", "p_phenotypeHF")])
+}
+write.table(df, file = paste("differential_expression/results/subtypes_DEG/EEC_HF_vCTRL.tsv", sep = ""), sep = '\t', row.names = FALSE)
+
+
+##FB
+subtypes = as.list(names(table(obs_FB$leiden))[table(obs_FB$leiden) > 50])
+names(subtypes) = names(table(obs_FB$leiden))[table(obs_FB$leiden) > 50]
+
+lists_subtypes = mclapply(subtypes, function(subtype) {
+    return(neb_analysis_v2(group_pheno = "phenotype", case = "CAD", control = "Control", obs = obs_FB, sel = TRUE, group_sel = "leiden", sel_id = subtype, sub_mtx = cts_mtx[rownames(obs_FB[obs_FB[["leiden"]] == subtype,]),]))
+}, mc.cores = 12)
+names(lists_subtypes)
+rows = c() 
+for (subtype_res in lists_subtypes) {   rows = c(rows, row.names(subtype_res)) } 
+rows = unique(rows)
+df = lists_subtypes[[1]][rows,c("gene", "logFC_phenotypeCAD", "p_phenotypeCAD")]
+for (i in 2:length(lists_subtypes)) {
+  df = cbind(df, lists_subtypes[[i]][rows ,c("logFC_phenotypeCAD", "p_phenotypeCAD")])
+}
+write.table(df, file = paste("differential_expression/results/subtypes_DEG/FB_CAD_vCTRL.tsv", sep = ""), sep = '\t', row.names = FALSE)
+
+lists_subtypes = mclapply(subtypes, function(subtype) {
+    return(neb_analysis_v2(group_pheno = "phenotype", case = "HF_CAD", control = "Control", obs = obs_FB, sel = TRUE, group_sel = "leiden", sel_id = subtype, sub_mtx = cts_mtx[rownames(obs_FB[obs_FB[["leiden"]] == subtype,]),]))
+}, mc.cores = 12)
+names(lists_subtypes)
+rows = c() 
+for (subtype_res in lists_subtypes) {   rows = c(rows, row.names(subtype_res)) } 
+rows = unique(rows)
+df = lists_subtypes[[1]][rows,c("gene", "logFC_phenotypeHF_CAD", "p_phenotypeHF_CAD")]
+for (i in 2:length(lists_subtypes)) {
+  df = cbind(df, lists_subtypes[[i]][rows ,c("logFC_phenotypeHF_CAD", "p_phenotypeHF_CAD")])
+}
+write.table(df, file = paste("differential_expression/results/subtypes_DEG/FB_HF_CAD_vCTRL.tsv", sep = ""), sep = '\t', row.names = FALSE)
+
+lists_subtypes = mclapply(subtypes, function(subtype) {
+    return(neb_analysis_v2(group_pheno = "phenotype", case = "HF_Congestive", control = "Control", obs = obs_FB, sel = TRUE, group_sel = "leiden", sel_id = subtype, sub_mtx = cts_mtx[rownames(obs_FB[obs_FB[["leiden"]] == subtype,]),]))
+}, mc.cores = 12)
+names(lists_subtypes)
+rows = c() 
+for (subtype_res in lists_subtypes) {   rows = c(rows, row.names(subtype_res)) } 
+rows = unique(rows)
+df = lists_subtypes[[1]][rows,c("gene", "logFC_phenotypeHF_Congestive", "p_phenotypeHF_Congestive")]
+for (i in 2:length(lists_subtypes)) {
+  df = cbind(df, lists_subtypes[[i]][rows ,c("logFC_phenotypeHF_Congestive", "p_phenotypeHF_Congestive")])
+}
+write.table(df, file = paste("differential_expression/results/subtypes_DEG/FB_HF_Congestive_vCTRL.tsv", sep = ""), sep = '\t', row.names = FALSE)
+
+lists_subtypes = mclapply(subtypes, function(subtype) {
+    return(neb_analysis_v2(group_pheno = "phenotype_HF", case = "HF", control = "Control", obs = obs_FB, sel = TRUE, group_sel = "leiden", sel_id = subtype, sub_mtx = cts_mtx[rownames(obs_FB[obs_FB[["leiden"]] == subtype,]),]))
+}, mc.cores = 12)
+names(lists_subtypes)
+rows = c() 
+for (subtype_res in lists_subtypes) {   rows = c(rows, row.names(subtype_res)) } 
+rows = unique(rows)
+df = lists_subtypes[[1]][rows,c("gene", "logFC_phenotypeHF", "p_phenotypeHF")]
+for (i in 2:length(lists_subtypes)) {
+  df = cbind(df, lists_subtypes[[i]][rows ,c("logFC_phenotypeHF", "p_phenotypeHF")])
+}
+write.table(df, file = paste("differential_expression/results/subtypes_DEG/FB_HF_vCTRL.tsv", sep = ""), sep = '\t', row.names = FALSE)
+
+
+##MESO
+subtypes = as.list(names(table(obs_MESO$leiden))[table(obs_MESO$leiden) > 50])
+names(subtypes) = names(table(obs_MESO$leiden))[table(obs_MESO$leiden) > 50]
+
+lists_subtypes = mclapply(subtypes, function(subtype) {
+    return(neb_analysis_v2(group_pheno = "phenotype", case = "CAD", control = "Control", obs = obs_MESO, sel = TRUE, group_sel = "leiden", sel_id = subtype, sub_mtx = cts_mtx[rownames(obs_MESO[obs_MESO[["leiden"]] == subtype,]),]))
+}, mc.cores = 12)
+lists_subtypes = lapply(subtypes, function(subtype) {
+    return(neb_analysis_v2(group_pheno = "phenotype", case = "CAD", control = "Control", obs = obs_MESO, sel = TRUE, group_sel = "leiden", sel_id = subtype, sub_mtx = cts_mtx[rownames(obs_MESO[obs_MESO[["leiden"]] == subtype,]),]))
+})
+names(lists_subtypes)
+rows = c() 
+for (subtype_res in lists_subtypes) {   rows = c(rows, row.names(subtype_res)) } 
+rows = unique(rows)
+df = lists_subtypes[[1]][rows,c("gene", "logFC_phenotypeCAD", "p_phenotypeCAD")]
+for (i in 2:length(lists_subtypes)) {
+  df = cbind(df, lists_subtypes[[i]][rows ,c("logFC_phenotypeCAD", "p_phenotypeCAD")])
+}
+write.table(df, file = paste("differential_expression/results/subtypes_DEG/MESO_CAD_vCTRL.tsv", sep = ""), sep = '\t', row.names = FALSE)
+
+lists_subtypes = mclapply(subtypes, function(subtype) {
+    return(neb_analysis_v2(group_pheno = "phenotype", case = "HF_CAD", control = "Control", obs = obs_MESO, sel = TRUE, group_sel = "leiden", sel_id = subtype, sub_mtx = cts_mtx[rownames(obs_MESO[obs_MESO[["leiden"]] == subtype,]),]))
+}, mc.cores = 12)
+names(lists_subtypes)
+rows = c() 
+for (subtype_res in lists_subtypes) {   rows = c(rows, row.names(subtype_res)) } 
+rows = unique(rows)
+df = lists_subtypes[[1]][rows,c("gene", "logFC_phenotypeHF_CAD", "p_phenotypeHF_CAD")]
+for (i in 2:length(lists_subtypes)) {
+  df = cbind(df, lists_subtypes[[i]][rows ,c("logFC_phenotypeHF_CAD", "p_phenotypeHF_CAD")])
+}
+write.table(df, file = paste("differential_expression/results/subtypes_DEG/MESO_HF_CAD_vCTRL.tsv", sep = ""), sep = '\t', row.names = FALSE)
+
+lists_subtypes = lapply(subtypes, function(subtype) {
+    return(neb_analysis_v2(group_pheno = "phenotype", case = "HF_Congestive", control = "Control", obs = obs_MESO, sel = TRUE, group_sel = "leiden", sel_id = subtype, sub_mtx = cts_mtx[rownames(obs_MESO[obs_MESO[["leiden"]] == subtype,]),]))
+})
+names(lists_subtypes)
+rows = c() 
+for (subtype_res in lists_subtypes) {   rows = c(rows, row.names(subtype_res)) } 
+rows = unique(rows)
+df = lists_subtypes[[1]][rows,c("gene", "logFC_phenotypeHF_Congestive", "p_phenotypeHF_Congestive")]
+for (i in 2:length(lists_subtypes)) {
+  df = cbind(df, lists_subtypes[[i]][rows ,c("logFC_phenotypeHF_Congestive", "p_phenotypeHF_Congestive")])
+}
+write.table(df, file = paste("differential_expression/results/subtypes_DEG/MESO_HF_Congestive_vCTRL.tsv", sep = ""), sep = '\t', row.names = FALSE)
+
+lists_subtypes = lapply(subtypes, function(subtype) {
+    return(neb_analysis_v2(group_pheno = "phenotype_HF", case = "HF", control = "Control", obs = obs_MESO, sel = TRUE, group_sel = "leiden", sel_id = subtype, sub_mtx = cts_mtx[rownames(obs_MESO[obs_MESO[["leiden"]] == subtype,]),]))
+})
+names(lists_subtypes)
+rows = c() 
+for (subtype_res in lists_subtypes) {   rows = c(rows, row.names(subtype_res)) } 
+rows = unique(rows)
+df = lists_subtypes[[1]][rows,c("gene", "logFC_phenotypeHF", "p_phenotypeHF")]
+for (i in 2:length(lists_subtypes)) {
+  df = cbind(df, lists_subtypes[[i]][rows ,c("logFC_phenotypeHF", "p_phenotypeHF")])
+}
+write.table(df, file = paste("differential_expression/results/subtypes_DEG/MESO_HF_vCTRL.tsv", sep = ""), sep = '\t', row.names = FALSE)
+
+
+
+```
+
+
+```{r Specific subgroups}
+
+diff_all_8_v_1 = neb_analysis_v2(group_pheno = "subleiden", case = "0", control = "1+3", obs = obs_CM, sel = FALSE, sub_mtx = cts_mtx[rownames(obs_CM),])
+df = diff_all_8_v_1[,c("gene", "logFC_phenotype0", "p_phenotype0")]
+write.table(df, file = paste("differential_expression/results/subcluster_enrich_DEG/CM_all_0v1+3.tsv", sep = ""), sep = '\t', row.names = FALSE, col.names = FALSE)
+df[,"p_phenotype0"] = p.adjust(df[,"p_phenotype0"], method = 'BH', n = length(df[,"p_phenotype0"]))
+write.table(df, file = paste("differential_expression/results/subcluster_enrich_DEG/CM_all_0v1+3_FDR.tsv", sep = ""), sep = '\t', row.names = FALSE, col.names = FALSE)
+
+
+diff_CADspe_v_Control_spe = neb_analysis_v2(group_pheno = "IHD_enr", case = "CAD+", control = "Control+", obs = obs_CM, sel = FALSE, sub_mtx = cts_mtx[rownames(obs_CM),])
+df = diff_CADspe_v_Control_spe[,c("gene", "logFC_phenotypeCAD+", "p_phenotypeCAD+")]
+write.table(df, file = paste("differential_expression/results/subcluster_enrich_DEG/CM_CAD_0vCtrl_1+3.tsv", sep = ""), sep = '\t', row.names = FALSE, col.names = FALSE)
+df[,"p_phenotypeCAD+"] = p.adjust(df[,"p_phenotypeCAD+"], method = 'BH', n = length(df[,"p_phenotypeCAD+"]))
+write.table(df, file = paste("differential_expression/results/subcluster_enrich_DEG/CM_CAD_0vCtrl_1+3_FDR.tsv", sep = ""), sep = '\t', row.names = FALSE, col.names = FALSE)
+
+
+### CM for HF_CAD
+
+obs_CM[, "HF_CAD_pheno"] = "other"
+obs_CM[(obs_CM$leiden %in% c("3", "1")) & (obs_CM$phenotype == "Control"), "HF_CAD_pheno"] = "Control+"
+obs_CM[(obs_CM$leiden %in% c("4", "1")) & (obs_CM$phenotype == "HF_CAD"), "HF_CAD_pheno"] = "HF_CAD+"
+diff_CADspe_v_Control_spe = neb_analysis_v2(group_pheno = "HF_CAD_pheno", case = "HF_CAD+", control = "Control+", obs = obs_CM, sel = FALSE, sub_mtx = cts_mtx[rownames(obs_CM),])
+df = diff_CADspe_v_Control_spe[,c("gene", "logFC_phenotypeHF_CAD+", "p_phenotypeHF_CAD+")]
+write.table(df, file = paste("differential_expression/results/subcluster_enrich_DEG/CM_HF_CAD_1+4vCtrl_1+3.tsv", sep = ""), sep = '\t', row.names = FALSE, col.names = FALSE)
+df[,"p_phenotypeHF_CAD+"] = p.adjust(df[,"p_phenotypeHF_CAD+"], method = 'BH', n = length(df[,"p_phenotypeHF_CAD+"]))
+write.table(df, file = paste("differential_expression/results/subcluster_enrich_DEG/CM_HF_CAD_1+4vCtrl_1+3.tsv_FDR.tsv", sep = ""), sep = '\t', row.names = FALSE, col.names = FALSE)
+
+
+analysis_spe <- function(case_groups, control_groups, case = "CAD", cell_type, obs, grouping_name = "leiden") {
+  obs[, "groups_pheno"] = "other"
+  obs[(obs[[grouping_name]] %in% case_groups), "groups_pheno"] = paste(case_groups, collapse = "+")
+  obs[(obs[[grouping_name]] %in% control_groups), "groups_pheno"] = paste(control_groups, collapse = "+")
+  print("1...")
+  diff_all = neb_analysis_v2(group_pheno = "groups_pheno", case = paste(case_groups, collapse = "+"), control = paste(control_groups, collapse = "+"), obs = obs, sel = FALSE, sub_mtx = cts_mtx[rownames(obs),])
+  df = diff_all[,c("gene", paste0("logFC_phenotype", paste(case_groups, collapse = "+")), paste0("p_phenotype", paste(case_groups, collapse = "+")))]
+  write.table(df, file = paste("differential_expression/results/subcluster_enrich_DEG_2/", cell_type, "_all", paste(case_groups, collapse = "+"), "v", control = paste(control_groups, collapse = "+"), ".tsv", sep = ""), sep = '\t', row.names = FALSE, col.names = FALSE)
+  df[,paste0("p_phenotype", paste(case_groups, collapse = "+"))] = p.adjust(df[,paste0("p_phenotype", paste(case_groups, collapse = "+"))], method = 'BH', n = length(df[,paste0("p_phenotype", paste(case_groups, collapse = "+"))]))
+  write.table(df, file = paste("differential_expression/results/subcluster_enrich_DEG_2/", cell_type, "_all", paste(case_groups, collapse = "+"), "v", control = paste(control_groups, collapse = "+"), "_FDR.tsv", sep = ""), sep = '\t', row.names = FALSE, col.names = FALSE)
+  
+  obs[, "pheno+"] = "other"
+  obs[(obs[[grouping_name]] %in% control_groups) & (obs$phenotype == "Control"), "pheno+"] = "Control+"
+  obs[(obs[[grouping_name]] %in% case_groups) & (obs$phenotype == case), "pheno+"] = paste0(case, "+")
+  obs[["pheno+"]] = as.factor(obs[["pheno+"]])
+  print("2...")
+  diff_pheno = neb_analysis_v2(group_pheno = "pheno+", case = paste0(case, "+"), control = "Control+", obs = obs, sel = FALSE, sub_mtx = cts_mtx[rownames(obs),])
+  df = diff_pheno[,c("gene", paste0("logFC_phenotype", case, "+"), paste0("p_phenotype", case, "+"))]
+  write.table(df, file = paste("differential_expression/results/subcluster_enrich_DEG_2/", cell_type, "_", case, paste(case_groups, collapse = "+"), "v", control = paste(control_groups, collapse = "+"), "_control", ".tsv", sep = ""), sep = '\t', row.names = FALSE, col.names = FALSE)
+  df[,paste0("p_phenotype", case, "+")] = p.adjust(df[,paste0("p_phenotype", case, "+")], method = 'BH', n = length(df[,paste0("p_phenotype", case, "+")]))
+  write.table(df, file = paste("differential_expression/results/subcluster_enrich_DEG_2/", cell_type, "_", case, paste(case_groups, collapse = "+"), "v", control = paste(control_groups, collapse = "+"), "_control", "_FDR.tsv", sep = ""), sep = '\t', row.names = FALSE, col.names = FALSE)
+}
+
+
+##EEC
+analysis_spe(c("0", "6", "9"), c("1"), case = "CAD", "EEC", obs_EEC)
+analysis_spe(c("5"), c("1"), case = "HF_CAD", "EEC", obs_EEC)
+analysis_spe(c("0"), c("1"), case = "HF_CAD", "EEC", obs_EEC)
+
+##MESO
+analysis_spe(c("1", "7", "9"), c("3", "2", "6", "4"), case = "CAD", "MESO", obs_MESO)
+analysis_spe(c("5", "8"), c("3", "2", "6", "4"), case = "HF_CAD", "MESO", obs_MESO)
+
+
+
+
+##OLD
+
+analysis_spe(c("5"), c("1", "3"), case = "HF_Congestive", "CM", obs_CM)
+
+##EEC
+analysis_spe(c("8", "6"), c("1"), case = "CAD", "EEC", obs_EEC)
+analysis_spe(c("5"), c("1"), case = "HF_CAD", "EEC", obs_EEC)
+analysis_spe(c("0"), c("1"), case = "HF_CAD", "EEC", obs_EEC)
+#analysis_spe(c("5"), c("1"), case = "HF_Congestive", "EEC", obs_EEC)
+
+##MESO
+analysis_spe(c("1", "7", "9"), c("3", "2", "6", "4"), case = "HF_CAD", "MESO", obs_MESO)
+analysis_spe(c("5", "8"), c("3", "2", "6", "4"), case = "CAD", "MESO", obs_MESO)
+
+##VASC
+analysis_spe(c("6", "8"), c("0"), case = "CAD", "VEC", obs_vasc, grouping_name = "leiden")
+analysis_spe(c("5"), c("0"), case = "HF_Congestive", "VEC", obs_vasc, grouping_name = "leiden")
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+##Select GWAS genes
+```{r}
+selected_all = read.table("sel_GWAS_genes_all.csv", sep = "\t", header = 1, row.names = 1)
+all_genes = list()
+for (cell_type in colnames(selected_all)) {
+  all_genes[[cell_type]] = row.names(selected_all[selected_all[[cell_type]] == "True",])
+}
+
+selected_EC = read.table("sel_GWAS_genes_EC.csv", sep = "\t", row.names = 1)
+colnames(selected_EC) = selected_EC[1,]
+selected_EC = selected_EC[2:nrow(selected_EC),]
+EC_genes = list()
+for (cell_type in colnames(selected_EC)) {
+  EC_genes[[cell_type]] = row.names(selected_EC[selected_EC[[cell_type]] == "True",])
+}
+
+
+DEG_CADvCtrl_AD = read.table("results/DEG_all_CADvsCtrl/DEG_CADvCtrl_AD.tsv", header = 1)
+DEG_CADvCtrl_AD = DEG_CADvCtrl_AD[DEG_CADvCtrl_AD$gene %in% all_genes$AD,]
+dir.create("results/GWAS_selected/DEG_all_CADvsCtrl")
+write.table(DEG_CADvCtrl_AD, "results/GWAS_selected/DEG_all_CADvsCtrl/DEG_all_CADvsCtrl_AD.tsv", sep = "\t", row.names = FALSE)
+
+folder_name = "DEG_all_CADvsCtrl"
+file_prefix = "DEG_CADvCtrl_"
+dir.create(paste("results/GWAS_selected/", folder_name, sep = ""))
+for (cell_type in names(all_genes)) {
+  expr = read.table(paste("results/", folder_name, '/', file_prefix, cell_type, ".tsv", sep = ""), header = 1)
+  expr = expr[expr$gene %in% all_genes[[cell_type]],]
+  write.table(expr, paste("results/GWAS_selected/", folder_name, '/', file_prefix, cell_type, ".tsv", sep = ""), sep = "\t", row.names = FALSE)
+}
+
+folders = list(
+  "all_CADvCtrl" = list(
+    "folder_name" = "DEG_all_CADvsCtrl",
+    "file_name" = "DEG_CADvCtrl_",
+    "gene_list" = all_genes
+  ),
+  "HF_allvCtrl" = list(
+    "folder_name" = "DEG_all_HF_allvControl",
+    "file_name" = "DEG_HF_allvCtrl_",
+    "gene_list" = all_genes
+  ),
+  "all_HFCADvCtrl" = list(
+    "folder_name" = "DEG_all_HF_CADvsCtrl",
+    "file_name" = "DEG_HF_CADvCtrl_",
+    "gene_list" = all_genes
+  ),
+  "all_CADvCtrl" = list(
+    "folder_name" = "DEG_all_HF_CongestivevsCtrl",
+    "file_name" = "DEG_HF_CongestivevCtrl_",
+    "gene_list" = all_genes
+  ),
+  "EC_CADvCtrl" = list(
+    "folder_name" = "DEG_EC_CADvCtrl",
+    "file_name" = "DEG_CADvCtrl_",
+    "gene_list" = EC_genes
+  ),
+  "EC_CADvCtrl" = list(
+    "folder_name" = "DEG_EC_HF_allvsControl",
+    "file_name" = "DEG_HF_allvCtrl_",
+    "gene_list" = EC_genes
+  ),
+  "EC_CADvCtrl" = list(
+    "folder_name" = "DEG_EC_HF_CADvCtrl",
+    "file_name" = "DEG_HF_CADvCtrl_",
+    "gene_list" = EC_genes
+  ),
+  "EC_CADvCtrl" = list(
+    "folder_name" = "DEG_EC_HF_CongestivevCtrl",
+    "file_name" = "DEG_HF_CongestivevCtrl_",
+    "gene_list" = EC_genes
+  )
+)
+
+lapply(folders, function(folder) {
+  folder_name = folder$folder_name
+  file_prefix = folder$file_name
+  genes_list = folder$gene_list
+  dir.create(paste("results/GWAS_selected/", folder_name, sep = ""))
+  for (cell_type in names(genes_list)) {
+    expr = read.table(paste("results/", folder_name, '/', file_prefix, cell_type, ".tsv", sep = ""), header = 1)
+    expr = expr[expr$gene %in% genes_list[[cell_type]],]
+    write.table(expr, paste("results/GWAS_selected/", folder_name, '/', file_prefix, cell_type, ".tsv", sep = ""), sep = "\t", row.names = FALSE)
+  }
+})
+
+
+folders = list(
+  "all_CADvCtrl" = list(
+    "folder_name" = "DEG_all_CADvsCtrl",
+    "file_name" = "DEG_CADvCtrl_",
+    "gene_list" = cell_types
+  ),
+  "HF_allvCtrl" = list(
+    "folder_name" = "DEG_all_HF_allvControl",
+    "file_name" = "DEG_HF_allvCtrl_",
+    "gene_list" = cell_types
+  ),
+  "all_HFCADvCtrl" = list(
+    "folder_name" = "DEG_all_HF_CADvsCtrl",
+    "file_name" = "DEG_HF_CADvCtrl_",
+    "gene_list" = cell_types
+  ),
+  "all_CADvCtrl" = list(
+    "folder_name" = "DEG_all_HF_CongestivevsCtrl",
+    "file_name" = "DEG_HF_CongestivevCtrl_",
+    "gene_list" = cell_types
+  ),
+  "EC_CADvCtrl" = list(
+    "folder_name" = "DEG_EC_CADvCtrl",
+    "file_name" = "DEG_CADvCtrl_",
+    "gene_list" = vasc_types
+  ),
+  "EC_CADvCtrl" = list(
+    "folder_name" = "DEG_EC_HF_allvsControl",
+    "file_name" = "DEG_HF_allvCtrl_",
+    "gene_list" = vasc_types
+  ),
+  "EC_CADvCtrl" = list(
+    "folder_name" = "DEG_EC_HF_CADvCtrl",
+    "file_name" = "DEG_HF_CADvCtrl_",
+    "gene_list" = vasc_types
+  ),
+  "EC_CADvCtrl" = list(
+    "folder_name" = "DEG_EC_HF_CongestivevCtrl",
+    "file_name" = "DEG_HF_CongestivevCtrl_",
+    "gene_list" = vasc_types
+  )
+)
+
+vasc_types = names(EC_genes)
+cell_types = names(all_genes)[c(1:3,5:8,10,11)]
+
+
+setwd("differential_expression/results/GWAS_selected/")
+
+gwas_results = lapply(as.list(vasc_types), function(type) {
+  read.table(paste0("results/GWAS_selected/DEG_EC_HF_CongestivevCtrl/DEG_HF_CongestivevCtrl_", type, ".tsv"), header = 1, row.names = 1)
+})
+
+genes_list = c()
+for (res in gwas_results) {
+  genes_list = c(genes_list, row.names(res))
+}
+genes_list = unique(genes_list)
+
+table_all = gwas_results[[1]][genes_list,]
+for (i in 2:length(vasc_types)) {
+  table_all = cbind(table_all, gwas_results[[i]][genes_list,])
+}
+
+write.table(table_all, "results/GWAS_selected/full_tables/fulltable.tsv", sep = "\t", row.names = FALSE)
+
+
+
+lapply(folders, function(folder) {
+  gwas_results = lapply(as.list(folder$gene_list), function(type) {
+    read.table(paste0("results/GWAS_selected/", folder$folder_name, '/', folder$file_name, type, ".tsv"), header = 1, row.names = 1)
+  })
+  genes_list = c()
+  for (res in gwas_results) {
+    genes_list = c(genes_list, row.names(res))
+  }
+  genes_list = unique(genes_list)
+  table_all = gwas_results[[1]][genes_list,]
+  row.names(table_all) = genes_list
+  for (i in 2:length(folder$gene_list)) {
+    table_all = cbind(table_all, gwas_results[[i]][genes_list,])
+  }
+  write.table(table_all, paste0("results/GWAS_selected/full_tables/", folder$folder_name, ".tsv"), sep = "\t", col.names = FALSE)
+})
+
+
+
+test = read.table("results/GWAS_selected/DEG_EC_HF_CongestivevCtrl/DEG_HF_CongestivevCtrl_Dividing EC.tsv", header = 1, row.names = 1)
+
+
+print(cell_types)
+
+```
+
+
+
+
+```{r}
+freq_expressed <- 0.2
+FCTHRESHOLD <- log2(1.5)
+
+dim(expression)
+head(obs)
+head(var_raw)
+
+head(maits$cdat)
+head(maits$fdat)
+
+obs$sample_id = as.factor(obs$sample_id)
+
+scaRaw <- FromMatrix(t(expression), obs, var_raw)
+
+sca_sel <- FromMatrix(t(expression[,row.names(var)]), obs, var)
+
+
+#aheatmap(assay(scaRaw[1:250,]), labRow='', annCol=as.data.frame(colData(scaRaw)[,c('phenotype', 'leiden')]), distfun='spearman')
+
+set.seed(123)
+plotPCA <- function(sca_obj){
+    projection <- rpca(t(assay(sca_obj)), retx=TRUE, k=4)$x
+    colnames(projection)=c("PC1","PC2","PC3","PC4")
+    pca <- data.table(projection,  as.data.frame(colData(sca_obj)))
+    print(ggpairs(pca, columns=c('PC1', 'PC2', 'PC3', 'n_genes', 'percent_mito', 'doublet_score', 'phase', 'batch'),
+            mapping=aes(color=phenotype), upper=list(continuous='blank')))
+    invisible(pca)
+}
+
+plotPCA(scaRaw)
+
+
+```
+
+
+```{r}
+sca = scaRaw
+
+scaSample <- sca[sample(which(freq(sca)>.1), 20),]
+flat <- as(scaSample, 'data.table')
+ggplot(flat, aes(x=value))+geom_density() +facet_wrap(~gene_ids, scale='free_y')
+
+thres <- thresholdSCRNACountMatrix(assay(sca), nbins = 20, min_per_bin = 30)
+par(mfrow=c(5,4))
+plot(thres)
+
+
+## GENE FILTERING
+assays(sca, withDimnames = FALSE) <- list(thresh=thres$counts_threshold, tpm=assay(sca))
+expressed_genes <- freq(sca) > freq_expressed
+sca <- sca[expressed_genes,]
+
+
+
+```
+
+
+#MODEL
+```{r}
+cond<-factor(colData(sca)$phenotype)
+cond<-relevel(cond,"Control")
+colData(sca)$phenotype<-cond
+zlmCond <- zlm(~phenotype + percent_mito + (1 | sample_id), sca, method='glmer',ebayes = F, strictConvergence = FALSE)
+# The following are equivalent
+## lrt <- lrTest(zlm, "condition")
+## lrt <- lrTest(zlm, CoefficientHypothesis('conditionStim'))
+
+# This would test if 2*cngeneson=conditionStim
+#  This is sheer nonsense biologically and statistically, but gives an example of the flexibility.
+## lrt <- lrTest(zlm, Hypothesis('2*cngeneson-conditionStim'))
+
+#only test the condition coefficient.
+summaryCond <- summary(zlmCond, doLRT='phenotypeCAD') 
+#print the top 4 genes by contrast using the logFC
+print(summaryCond, n=4)
+## by discrete Z-score
+print(summaryCond, n=4, by='D')
+## by continuous Z-score
+print(summaryCond, n=4, by='C')
+
+
+```
+
+Visualize
+```{r}
+summaryDt <- summaryCond$datatable
+fcHurdle <- merge(summaryDt[contrast=='phenotypeCAD' & component=='H',.(primerid, `Pr(>Chisq)`)], #hurdle P values
+                      summaryDt[contrast=='phenotypeCAD' & component=='logFC', .(primerid, coef, ci.hi, ci.lo)], by='primerid') #logFC coefficients
+
+fcHurdle[,fdr:=p.adjust(`Pr(>Chisq)`, 'fdr')]
+fcHurdleSig <- merge(fcHurdle[fdr<.50 & abs(coef)>FCTHRESHOLD], as.data.table(mcols(sca)), by='primerid')
+setorder(fcHurdleSig, fdr)
+setorder(fcHurdle, fdr)
+
+
+num = ifelse(nrow(fcHurdleSig) > 50, 50, nrow(fcHurdleSig))
+entrez_to_plot <- fcHurdleSig[1:num,primerid]
+symbols_to_plot <- fcHurdleSig[1:num,primerid]
+flat_dat <- as(sca[entrez_to_plot,], 'data.table')
+ggbase <- ggplot(flat_dat, aes(x=phenotype, y=thresh,color=phenotype)) + geom_jitter()+facet_wrap(~primerid, scale='free_y')+ggtitle("DE Genes in CA (CAD)")
+ggbase+geom_violin() 
+
+
+#flat_dat[,lmPred:=lm(thresh~n_genes + phenotype + percent_mito)$fitted, key=primerid]
+#ggbase +aes(x=percent_mito) + geom_line(aes(y=lmPred), lty=1) + xlab('Standardized Cellular Detection Rate')
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
